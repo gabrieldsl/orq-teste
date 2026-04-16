@@ -1,0 +1,3 @@
+account_id,data_inicio,data_fim,descricao
+123456789012,2024-01-01T00:00:00,2024-01-07T23:59:59,Conta de producao
+987654321098,2024-01-01T00:00:00,2024-01-07T23:59:59,Conta de homologacao
