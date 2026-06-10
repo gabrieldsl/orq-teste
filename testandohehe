@@ -1,0 +1,550 @@
+#!/usr/bin/env python3
+"""
+NICE CXone - JWT Token Access Mapper
+=====================================
+Decodifica um JWT token do CXone, detecta o ambiente/tenant automaticamente
+e testa sistematicamente quais endpoints da API estão acessíveis com esse token.
+
+Uso:
+    python cxone_token_mapper.py --token <SEU_JWT_TOKEN>
+    python cxone_token_mapper.py --token <SEU_JWT_TOKEN> --base-url https://api-na1.niceincontact.com
+    python cxone_token_mapper.py --token <SEU_JWT_TOKEN> --output resultado.json
+    python cxone_token_mapper.py --token <SEU_JWT_TOKEN> --verbose
+
+Dependências:
+    pip install requests PyJWT
+"""
+
+import argparse
+import base64
+import json
+import sys
+import time
+from datetime import datetime, timezone
+from typing import Optional
+
+try:
+    import requests
+except ImportError:
+    print("[ERRO] Biblioteca 'requests' não encontrada. Execute: pip install requests")
+    sys.exit(1)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Configuração dos grupos de endpoints a testar
+# Cada entrada: (label, method, path_template, params_opcionais)
+# Os placeholders {bu_id} e {agent_id} são preenchidos automaticamente a partir
+# do payload do JWT quando disponíveis.
+# ─────────────────────────────────────────────────────────────────────────────
+ENDPOINT_GROUPS = {
+    "Admin - Agents": [
+        ("GET", "/incontactapi/services/v27.0/agents", {}),
+        ("GET", "/incontactapi/services/v27.0/agents/skills", {}),
+        ("GET", "/incontactapi/services/v27.0/agents/groups", {}),
+        ("GET", "/incontactapi/services/v27.0/security-profiles", {}),
+    ],
+    "Admin - Skills": [
+        ("GET", "/incontactapi/services/v27.0/skills", {}),
+        ("GET", "/incontactapi/services/v27.0/skills/summary", {}),
+        ("GET", "/incontactapi/services/v27.0/skills/agents", {}),
+    ],
+    "Admin - Usuários / BU": [
+        ("GET", "/incontactapi/services/v27.0/business-unit", {}),
+        ("GET", "/incontactapi/services/v27.0/teams", {}),
+        ("GET", "/incontactapi/services/v27.0/address-books", {}),
+        ("GET", "/incontactapi/services/v27.0/dnc-groups", {}),
+    ],
+    "Admin - Campanhas e Discadores": [
+        ("GET", "/incontactapi/services/v27.0/campaigns", {}),
+        ("GET", "/incontactapi/services/v27.0/lists/call-lists", {}),
+        ("GET", "/incontactapi/services/v27.0/lists/do-not-call", {}),
+    ],
+    "Admin - Configurações": [
+        ("GET", "/incontactapi/services/v27.0/points-of-contact", {}),
+        ("GET", "/incontactapi/services/v27.0/scripts", {}),
+        ("GET", "/incontactapi/services/v27.0/media-types", {}),
+        ("GET", "/incontactapi/services/v27.0/hours-of-operation", {}),
+        ("GET", "/incontactapi/services/v27.0/dispositions", {}),
+        ("GET", "/incontactapi/services/v27.0/tags", {}),
+    ],
+    "Real-Time Data": [
+        ("GET", "/incontactapi/services/v27.0/agents/states", {}),
+        ("GET", "/incontactapi/services/v27.0/contacts/states", {}),
+        ("GET", "/incontactapi/services/v27.0/skills/queues", {}),
+        ("GET", "/incontactapi/services/v27.0/contacts/active", {}),
+        ("GET", "/incontactapi/services/v27.0/agents/active-contacts", {}),
+    ],
+    "Reporting": [
+        ("GET", "/incontactapi/services/v27.0/report-jobs", {}),
+        ("GET", "/incontactapi/services/v27.0/agents/performance/current", {}),
+        ("GET", "/incontactapi/services/v27.0/skills/performance/current", {}),
+        ("GET", "/incontactapi/services/v27.0/contacts/completed", {
+            "startDate": "2024-01-01T00:00:00Z",
+            "endDate": "2024-01-02T00:00:00Z",
+        }),
+    ],
+    "WFM (Workforce Management)": [
+        ("GET", "/wfm/v1/wfm/agents", {}),
+        ("GET", "/wfm/v1/wfm/schedules", {}),
+        ("GET", "/wfm/v1/wfm/forecasts", {}),
+    ],
+    "Recording": [
+        ("GET", "/incontactapi/services/v27.0/interactions/recordings", {
+            "startDate": "2024-01-01",
+            "endDate": "2024-01-02",
+        }),
+    ],
+    "Data Extraction": [
+        ("GET", "/incontactapi/services/v27.0/data-extraction/segment-metadata", {
+            "startDate": "2024-01-01T00:00:00Z",
+            "endDate": "2024-01-02T00:00:00Z",
+        }),
+    ],
+    "Digital Engagement": [
+        ("GET", "/dfo/2.0/channels", {}),
+        ("GET", "/dfo/2.0/cases", {}),
+        ("GET", "/dfo/2.0/contacts", {}),
+    ],
+    "Privacy / GDPR": [
+        ("GET", "/incontactapi/services/v27.0/privacy/requests", {}),
+    ],
+    "UserHub": [
+        ("GET", "/userhub/v1/users/me", {}),
+        ("GET", "/userhub/v1/tenants/me", {}),
+    ],
+    "Authentication": [
+        ("GET", "/auth/token-info", {}),
+        ("GET", "/auth/userinfo", {}),
+    ],
+}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Funções auxiliares
+# ─────────────────────────────────────────────────────────────────────────────
+
+def decode_jwt_payload(token: str) -> dict:
+    """Decodifica o payload de um JWT sem verificar assinatura."""
+    try:
+        parts = token.split(".")
+        if len(parts) != 3:
+            raise ValueError("Token JWT inválido: esperado 3 partes separadas por '.'")
+        # Ajusta o padding do base64
+        payload_b64 = parts[1]
+        padding = 4 - len(payload_b64) % 4
+        if padding != 4:
+            payload_b64 += "=" * padding
+        decoded = base64.urlsafe_b64decode(payload_b64)
+        return json.loads(decoded)
+    except Exception as e:
+        raise ValueError(f"Não foi possível decodificar o JWT: {e}")
+
+
+def decode_jwt_header(token: str) -> dict:
+    """Decodifica o header de um JWT."""
+    try:
+        parts = token.split(".")
+        header_b64 = parts[0]
+        padding = 4 - len(header_b64) % 4
+        if padding != 4:
+            header_b64 += "=" * padding
+        decoded = base64.urlsafe_b64decode(header_b64)
+        return json.loads(decoded)
+    except Exception:
+        return {}
+
+
+def discover_base_url(tenant_id: str, issuer: str = "https://cxone.niceincontact.com") -> Optional[str]:
+    """
+    Usa o endpoint de descoberta do CXone para obter a URL base correta da API.
+    Retorna a api_endpoint ou None em caso de falha.
+    """
+    discovery_url = f"{issuer}/.well-known/cxone-configuration"
+    try:
+        resp = requests.get(
+            discovery_url,
+            params={"tenantId": tenant_id},
+            timeout=10
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            return data.get("api_endpoint")
+    except Exception:
+        pass
+    return None
+
+
+def format_status(code: int) -> str:
+    """Formata o código HTTP com símbolo visual."""
+    if code == 200:
+        return f"✅ {code} OK"
+    elif code == 201:
+        return f"✅ {code} Created"
+    elif code == 204:
+        return f"✅ {code} No Content"
+    elif code in (400, 422):
+        return f"⚠️  {code} Bad Request (endpoint existe mas parâmetros precisam ajuste)"
+    elif code == 401:
+        return f"🔒 {code} Unauthorized"
+    elif code == 403:
+        return f"🚫 {code} Forbidden (sem permissão)"
+    elif code == 404:
+        return f"❓ {code} Not Found"
+    elif code == 405:
+        return f"⚠️  {code} Method Not Allowed"
+    elif code == 429:
+        return f"⏳ {code} Rate Limited"
+    elif 500 <= code < 600:
+        return f"💥 {code} Server Error"
+    else:
+        return f"❔ {code}"
+
+
+def is_accessible(code: int) -> bool:
+    """Considera que o endpoint é acessível se não retornar 401 ou 403."""
+    return code not in (401, 403)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Funções principais
+# ─────────────────────────────────────────────────────────────────────────────
+
+def print_token_info(payload: dict, header: dict):
+    """Exibe as informações extraídas do token de forma formatada."""
+    print("\n" + "═" * 65)
+    print("  🔑  INFORMAÇÕES DO JWT TOKEN")
+    print("═" * 65)
+
+    # Identidade
+    print("\n📋  IDENTIDADE")
+    print(f"  Usuário (sub):      {payload.get('sub', 'N/A')}")
+    print(f"  Nome:               {payload.get('name', 'N/A')}")
+    print(f"  Nome Completo:      {payload.get('given_name', '')} {payload.get('family_name', '')}")
+    print(f"  Agent ID (icAgent): {payload.get('icAgentId', 'N/A')}")
+    print(f"  SP ID (icSPId):     {payload.get('icSPId', 'N/A')}")
+    print(f"  BU ID (icBUId):     {payload.get('icBUId', 'N/A')}")
+
+    # Tenant
+    print("\n🏢  TENANT")
+    print(f"  Tenant ID:          {payload.get('tenantId', 'N/A')}")
+    print(f"  Tenant Name:        {payload.get('tenant', 'N/A')}")
+    print(f"  Cluster:            {payload.get('icClusterId', 'N/A')}")
+    print(f"  Area:               {payload.get('area', 'N/A')}")
+    print(f"  Domain:             {payload.get('icDomain', 'N/A')}")
+
+    # Role / Permissões
+    role = payload.get("role", {})
+    if role:
+        print("\n👤  ROLE / PERFIL")
+        print(f"  Role ID:            {role.get('id', 'N/A')}")
+        print(f"  Role Legacy ID:     {role.get('legacyId', 'N/A')}")
+        sec_roles = role.get("secondaryRoles", [])
+        if sec_roles:
+            print(f"  Roles Secundários:  {', '.join(str(r) for r in sec_roles)}")
+
+    # Validade do token
+    iat = payload.get("iat")
+    exp = payload.get("exp")
+    print("\n⏰  VALIDADE")
+    if iat:
+        issued_at = datetime.fromtimestamp(iat, tz=timezone.utc)
+        print(f"  Emitido em:         {issued_at.strftime('%Y-%m-%d %H:%M:%S UTC')}")
+    if exp:
+        expires_at = datetime.fromtimestamp(exp, tz=timezone.utc)
+        now = datetime.now(tz=timezone.utc)
+        remaining = exp - int(now.timestamp())
+        status = f"⚠️  EXPIRADO há {abs(remaining)}s" if remaining < 0 else f"✅ válido por {remaining}s"
+        print(f"  Expira em:          {expires_at.strftime('%Y-%m-%d %H:%M:%S UTC')}  [{status}]")
+
+    # Header JWT
+    print("\n🔏  HEADER JWT")
+    print(f"  Algoritmo:          {header.get('alg', 'N/A')}")
+    print(f"  Tipo:               {header.get('typ', 'N/A')}")
+    print(f"  Key ID (kid):       {header.get('kid', 'N/A')}")
+
+    # Audience / Issuer
+    print("\n🌐  AUDIENCE / ISSUER")
+    print(f"  Issuer (iss):       {payload.get('iss', 'N/A')}")
+    print(f"  Audience (aud):     {payload.get('aud', 'N/A')}")
+
+    print("═" * 65)
+
+
+def test_endpoints(
+    token: str,
+    base_url: str,
+    payload: dict,
+    verbose: bool = False,
+    delay: float = 0.3,
+) -> dict:
+    """
+    Testa todos os endpoints configurados e retorna um dicionário com os resultados.
+    """
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+
+    results = {}
+    total = sum(len(v) for v in ENDPOINT_GROUPS.values())
+    tested = 0
+
+    # Extrai IDs úteis do payload para substituir em paths dinâmicos
+    agent_id = payload.get("icAgentId", "")
+    bu_id = payload.get("icBUId", "")
+
+    print(f"\n\n{'═' * 65}")
+    print(f"  🔍  TESTANDO ACESSOS DA API  ({total} endpoints em {len(ENDPOINT_GROUPS)} grupos)")
+    print(f"  Base URL: {base_url}")
+    print("═" * 65)
+
+    for group_name, endpoints in ENDPOINT_GROUPS.items():
+        print(f"\n📁  {group_name}")
+        print(f"  {'─' * 60}")
+        results[group_name] = []
+
+        for method, path, params in endpoints:
+            tested += 1
+            # Substitui placeholders no path, se houver
+            path_resolved = path.format(
+                agent_id=agent_id,
+                bu_id=bu_id,
+            )
+            url = f"{base_url.rstrip('/')}{path_resolved}"
+
+            try:
+                if method == "GET":
+                    resp = requests.get(url, headers=headers, params=params, timeout=10)
+                elif method == "POST":
+                    resp = requests.post(url, headers=headers, json=params, timeout=10)
+                else:
+                    resp = requests.request(method, url, headers=headers, timeout=10)
+
+                code = resp.status_code
+                accessible = is_accessible(code)
+                status_str = format_status(code)
+
+                entry = {
+                    "method": method,
+                    "path": path_resolved,
+                    "status_code": code,
+                    "accessible": accessible,
+                }
+
+                if verbose and accessible and code == 200:
+                    # Mostra preview da resposta em modo verbose
+                    try:
+                        body = resp.json()
+                        preview = json.dumps(body)[:120] + "..." if len(json.dumps(body)) > 120 else json.dumps(body)
+                        entry["response_preview"] = preview
+                    except Exception:
+                        entry["response_preview"] = resp.text[:120]
+
+                results[group_name].append(entry)
+
+                indicator = "  ✅" if accessible else "  🚫"
+                print(f"  [{tested:>3}/{total}] {indicator}  {method:<6} {path_resolved:<60} {status_str}")
+
+                if verbose and entry.get("response_preview"):
+                    print(f"            📄 {entry['response_preview']}")
+
+            except requests.exceptions.ConnectionError:
+                results[group_name].append({
+                    "method": method,
+                    "path": path_resolved,
+                    "status_code": 0,
+                    "accessible": False,
+                    "error": "Connection error",
+                })
+                print(f"  [{tested:>3}/{total}]   ❌  {method:<6} {path_resolved:<60} ❌ Erro de conexão")
+            except requests.exceptions.Timeout:
+                results[group_name].append({
+                    "method": method,
+                    "path": path_resolved,
+                    "status_code": 0,
+                    "accessible": False,
+                    "error": "Timeout",
+                })
+                print(f"  [{tested:>3}/{total}]   ⏳  {method:<6} {path_resolved:<60} ⏳ Timeout")
+            except Exception as e:
+                results[group_name].append({
+                    "method": method,
+                    "path": path_resolved,
+                    "status_code": 0,
+                    "accessible": False,
+                    "error": str(e),
+                })
+                print(f"  [{tested:>3}/{total}]   ❌  {method:<6} {path_resolved:<60} ❌ {e}")
+
+            time.sleep(delay)  # Evita rate limit
+
+    return results
+
+
+def print_summary(results: dict):
+    """Exibe um resumo consolidado dos resultados."""
+    print(f"\n\n{'═' * 65}")
+    print("  📊  RESUMO DO MAPEAMENTO DE ACESSOS")
+    print("═" * 65)
+
+    total_accessible = 0
+    total_blocked = 0
+
+    for group, entries in results.items():
+        accessible = [e for e in entries if e["accessible"]]
+        blocked = [e for e in entries if not e["accessible"]]
+        total_accessible += len(accessible)
+        total_blocked += len(blocked)
+
+        icon = "✅" if accessible else "🚫"
+        print(f"\n{icon}  {group}  ({len(accessible)}/{len(entries)} acessíveis)")
+
+        for e in accessible:
+            print(f"     ✅  {e['method']:<6} {e['path']}  [{e['status_code']}]")
+        for e in blocked:
+            print(f"     🚫  {e['method']:<6} {e['path']}  [{e['status_code']}]")
+
+    total = total_accessible + total_blocked
+    pct = (total_accessible / total * 100) if total > 0 else 0
+    print(f"\n{'═' * 65}")
+    print(f"  TOTAL:  {total_accessible} acessíveis  /  {total_blocked} bloqueados  /  {total} testados")
+    print(f"  COBERTURA:  {pct:.1f}% dos endpoints são acessíveis com este token")
+    print("═" * 65)
+
+
+def save_results(results: dict, payload: dict, base_url: str, output_path: str):
+    """Salva os resultados em JSON."""
+    output = {
+        "scan_timestamp": datetime.now(tz=timezone.utc).isoformat(),
+        "base_url": base_url,
+        "token_info": {
+            "sub": payload.get("sub"),
+            "name": payload.get("name"),
+            "tenant": payload.get("tenant"),
+            "tenantId": payload.get("tenantId"),
+            "icAgentId": payload.get("icAgentId"),
+            "icBUId": payload.get("icBUId"),
+            "role": payload.get("role"),
+            "exp": payload.get("exp"),
+        },
+        "results": results,
+    }
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump(output, f, indent=2, ensure_ascii=False)
+    print(f"\n💾  Resultados salvos em: {output_path}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Entry point
+# ─────────────────────────────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="NICE CXone - Mapeador de acessos via JWT Token",
+        formatter_class=argparse.RawTextHelpFormatter,
+    )
+    parser.add_argument(
+        "--token", "-t",
+        required=True,
+        help="JWT token do NICE CXone (access_token ou id_token)",
+    )
+    parser.add_argument(
+        "--base-url", "-u",
+        default=None,
+        help="URL base da API (ex: https://api-na1.niceincontact.com).\n"
+             "Se não fornecido, será detectado automaticamente via API Discovery.",
+    )
+    parser.add_argument(
+        "--issuer", "-i",
+        default="https://cxone.niceincontact.com",
+        help="Issuer do CXone (padrão: https://cxone.niceincontact.com).\n"
+             "Use https://cxone-gov.niceincontact.com para ambientes FedRAMP.",
+    )
+    parser.add_argument(
+        "--output", "-o",
+        default=None,
+        help="Caminho do arquivo JSON para salvar os resultados.",
+    )
+    parser.add_argument(
+        "--verbose", "-v",
+        action="store_true",
+        help="Modo verbose: exibe preview das respostas bem-sucedidas.",
+    )
+    parser.add_argument(
+        "--delay", "-d",
+        type=float,
+        default=0.3,
+        help="Delay em segundos entre requisições (padrão: 0.3s). Aumente se sofrer rate limit.",
+    )
+    args = parser.parse_args()
+
+    token = args.token.strip()
+
+    # 1. Decodifica o JWT
+    print("\n🔐  Decodificando JWT...")
+    try:
+        payload = decode_jwt_payload(token)
+        header = decode_jwt_header(token)
+    except ValueError as e:
+        print(f"[ERRO] {e}")
+        sys.exit(1)
+
+    # 2. Exibe info do token
+    print_token_info(payload, header)
+
+    # 3. Verifica se o token está expirado
+    exp = payload.get("exp", 0)
+    now_ts = int(datetime.now(tz=timezone.utc).timestamp())
+    if exp and exp < now_ts:
+        print(f"\n⚠️  AVISO: O token está EXPIRADO há {now_ts - exp} segundos.")
+        print("   As chamadas à API provavelmente retornarão 401. Continue mesmo assim? [s/N] ", end="")
+        answer = input().strip().lower()
+        if answer not in ("s", "sim", "y", "yes"):
+            print("Abortando.")
+            sys.exit(0)
+
+    # 4. Determina a base URL
+    base_url = args.base_url
+    if not base_url:
+        tenant_id = payload.get("tenantId")
+        area = payload.get("area")
+        domain = payload.get("icDomain")
+
+        if tenant_id:
+            print(f"\n🌐  Descobrindo URL base via API Discovery (tenantId={tenant_id})...")
+            base_url = discover_base_url(tenant_id, issuer=args.issuer)
+            if base_url:
+                print(f"   ✅ URL base detectada: {base_url}")
+            else:
+                print("   ⚠️  Descoberta falhou.")
+
+        if not base_url and area and domain:
+            base_url = f"https://api-{area}.{domain}"
+            print(f"   📌 URL construída a partir do token: {base_url}")
+
+        if not base_url:
+            base_url = "https://api-na1.niceincontact.com"
+            print(f"   📌 Usando URL padrão (NA1): {base_url}")
+
+    # 5. Testa os endpoints
+    results = test_endpoints(
+        token=token,
+        base_url=base_url,
+        payload=payload,
+        verbose=args.verbose,
+        delay=args.delay,
+    )
+
+    # 6. Exibe o resumo
+    print_summary(results)
+
+    # 7. Salva em JSON se solicitado
+    if args.output:
+        save_results(results, payload, base_url, args.output)
+
+    print("\n✅  Mapeamento concluído!\n")
+
+
+if __name__ == "__main__":
+    main()
